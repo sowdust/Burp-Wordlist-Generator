@@ -1,208 +1,231 @@
 '''
-A Burp extension to extract various data from the sitemap. This data can
-later be used in personalized wordlists.
+A Burp extension to extract various data from the sitemap.
+This data can later be used in personalized wordlists.
 
-Created by Laurens van der Poel (ldcvanderpoel).
+Refactored version (Jython-compatible).
 '''
 
 import threading
 import os
-from uuid import uuid4
+import sys
 from urlparse import urlparse
 
-from burp import IBurpExtender
-from burp import IContextMenuFactory
-from java.util import ArrayList
-from javax.swing import JMenuItem, JRadioButton
-from burp.IParameter import PARAM_BODY,PARAM_JSON,PARAM_URL,PARAM_XML
+from burp import IBurpExtender, IContextMenuFactory
+from burp.IParameter import (
+    PARAM_URL, PARAM_BODY, PARAM_JSON, PARAM_XML
+)
 from burp.IContextMenuInvocation import CONTEXT_TARGET_SITE_MAP_TREE
+
+from java.util import ArrayList
+from javax.swing import JMenuItem
 from java.awt import Frame
 
+
+# =========================
+# Helper Classes
+# =========================
+
+class Wordlists(object):
+    def __init__(self):
+        self.paths = set()
+        self.param_keys = set()
+        self.param_values = set()
+        self.param_queries = set()
+        self.subdomains = set()
+
+    def clear(self):
+        self.paths.clear()
+        self.param_keys.clear()
+        self.param_values.clear()
+        self.param_queries.clear()
+        self.subdomains.clear()
+
+
+# =========================
+# Burp Extension
+# =========================
+
 class BurpExtender(IBurpExtender, IContextMenuFactory):
+
+    # -------------------------
+    # Initialization
+    # -------------------------
+
     def registerExtenderCallbacks(self, callbacks):
-        '''
-        Extension initialization.
-        A unique directory is created for each seperate project.
-        '''
         sys.stdout = callbacks.getStdout()
         sys.stderr = callbacks.getStderr()
+
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
+
         callbacks.setExtensionName("Wordlist Generator")
         callbacks.registerContextMenuFactory(self)
 
-        # Set up wordlist output directory
-        self.wordlistDir = os.path.abspath(os.getcwd()) + \
-            '/wordlists/' + self.getProjectTitle() + '/'
-        if not os.path.exists(self.wordlistDir):
-            os.makedirs(self.wordlistDir)
+        self.wordlists = Wordlists()
+        self.wordlistDir = self._init_output_dir()
 
-        print('Wordlist generator initialized.')
-        print('Writing to directory: ' + self.wordlistDir)
+        print("Wordlist Generator initialized")
+        print("Writing to: %s" % self.wordlistDir)
+
+    def _init_output_dir(self):
+        base = os.path.abspath(os.getcwd())
+        path = os.path.join(base, "wordlists", self.getProjectTitle())
+        if not os.path.exists(path):
+            os.makedirs(path)
+        return path
+
+    # -------------------------
+    # Context Menu
+    # -------------------------
 
     def createMenuItems(self, invocation):
-        '''
-        Creates the context menu entry when right clicking the site map.
-        '''
-        context = invocation.getInvocationContext()
+        if invocation.getInvocationContext() != CONTEXT_TARGET_SITE_MAP_TREE:
+            return None
 
-        if context != CONTEXT_TARGET_SITE_MAP_TREE:
-            return
+        menu = ArrayList()
 
-        menuList = ArrayList()
-        menuItem = JMenuItem("Generate wordlist from entire sitemap",
-                                actionPerformed=self.menuActionFull)
-        menuList.add(menuItem)
+        full = JMenuItem(
+            "Generate wordlist from entire sitemap",
+            actionPerformed=self._menu_full
+        )
+        menu.add(full)
 
-        self.selection = invocation.getSelectedMessages()
-        if len(self.selection) > 0:
-            menuItem = JMenuItem("Generate wordlist from selection",
-                                actionPerformed=self.menuActionSelection)
-            menuList.add(menuItem)
-        return menuList
+        selection = invocation.getSelectedMessages()
+        if selection:
+            self._selection = selection
+            selected = JMenuItem(
+                "Generate wordlist from selection",
+                actionPerformed=self._menu_selection
+            )
+            menu.add(selected)
 
+        return menu
 
-    # TODO: Two menu actions is ugly, but I'm not sure how to pass
-    # arguments to `actionPerformed` in `JMenuItem`. Perhaps inspiration
-    # can be drawn from Autorize:
-    # https://github.com/Quitten/Autorize/blob/ce5479755cb152c0b65185b3d484665852d66506/gui/menu.py
-    def menuActionFull(self, event):
-        '''
-        Basic threaded menu action.
-        Prevents the UI from freezing.
-        '''
-        
+    def _menu_full(self, event):
         sitemap = self._callbacks.getSiteMap(None)
-        t = threading.Thread(target=self.generateWordlist, args=(sitemap,))
+        self._run_async(self.generate, sitemap)
+
+    def _menu_selection(self, event):
+        self._run_async(self.generate, self._selection)
+
+    def _run_async(self, target, *args):
+        t = threading.Thread(target=target, args=args)
         t.daemon = True
         t.start()
 
+    # -------------------------
+    # Core Logic
+    # -------------------------
 
-    def menuActionSelection(self, event):
-        '''
-        Basic threaded menu action.
-        Prevents the UI from freezing.
-        '''
-        
-        selection = self.selection
-        t = threading.Thread(target=self.generateWordlist, args=(selection,))
-        t.daemon = True
-        t.start()
+    def generate(self, requestResponses):
+        self.wordlists.clear()
 
-    def generateWordlist(self, requestResponses):
-        '''
-        Loop over the sitemap and add collect data for the wordlists.
-        Only in-scope items are considered.
-        Current wordlists created:
-        - Path
-        - Parameter keys
-        - Parameter values
-        - Parameter key-value pairs (query)
-        - Subdomain
-        '''
-
-        print('Generating wordlist.')
-        self.paths = set()
-        self.keys = set()
-        self.values = set()
-        self.queries = set()
-        self.subdomains = set()
+        total = len(requestResponses)
         count = 0
 
-        # Loop over sitemap
-        total = len(requestResponses)
-        for requestResponse in requestResponses:
+        print("Generating wordlists (%d items)" % total)
+
+        for rr in requestResponses:
             count += 1
-            requestInfo = self._helpers.analyzeRequest(requestResponse)
-            url = requestInfo.getUrl().toString().encode('utf-8')   
-            method = requestInfo.getMethod().encode('utf-8')
-
-            # Ignore out-of-scope requests
-            if not self._callbacks.isInScope(requestInfo.getUrl()):
-                print('[%i/%i]: %s (Not in scope, skipped)' % (count, total, url))
-                continue
-
-            print('[%i/%i]: %s %s' % (count, total, method, url))
-
-            # Try to gather data
             try:
-                self.processPath(url)
-                self.processSubdomain(url)
+                self._process_request(rr, count, total)
+            except Exception as e:
+                sys.stderr.write(
+                    "Error processing request (%d/%d): %s\n"
+                    % (count, total, str(e))
+                )
 
-                for param in requestInfo.getParameters():
-                    self.processParams(param)
-            except:
-                sys.stderr.write('An error occured during processing of "%s"\n'\
-                    % url)
-                sys.stderr.flush()
+        self._store_all()
+        print("Done!")
 
-                
-        print('Storing wordlists to %s' % self.wordlistDir)
-        self.storeWordlist(self.paths, 'paths.txt')
-        self.storeWordlist(self.keys, 'keys.txt')
-        self.storeWordlist(self.values, 'values.txt')
-        self.storeWordlist(self.queries, 'queries.txt')
-        self.storeWordlist(self.subdomains, 'subdomains.txt')
-        print('Done!')
+    def _process_request(self, requestResponse, count, total):
+        requestInfo = self._helpers.analyzeRequest(requestResponse)
+        url_obj = requestInfo.getUrl()
 
-    def processPath(self, url):
-        '''
-        Extract path from URL.
-        Assumes that the url is properly UTF-8 encoded.
-        '''
-        path = urlparse(url).path
-        self.paths.add(path)
-    
-    def processSubdomain(self, url):
-        '''
-        Get subdomains from URL. E.g.
-        acc.v1.website.com => acc.v1
-        Assumes that the url is properly UTF-8 encoded.
-        '''
-        subdomain = '.'.join(urlparse(url).netloc.split('.')[:-2])
-        self.subdomains.add(subdomain)
-
-    def processParams(self, param):
-        '''
-        Extract parameter keys, values, and key-value pairs (queries).
-        Parameters from cookies, multipart forms, and XML attributes are
-        ignored (PARAM_COOKIE, PARAM_MULTIPART_ATTR, and PARAM_XML_ATTR).
-
-        `bytesToString` is necessary (instead of str()), because `param.getName` 
-        and `param.getValue()` return bytes.
-        '''
-        if int(param.getType()) not in [
-            PARAM_URL,
-            PARAM_BODY,
-            PARAM_JSON,
-            PARAM_XML
-            ]:
+        if not self._callbacks.isInScope(url_obj):
+            print("[%d/%d] %s (out of scope)" % (count, total, url_obj))
             return
-        
-        key = self._helpers.bytesToString(param.getName()).encode('utf-8')
-        value = self._helpers.bytesToString(param.getValue()).encode('utf-8')
-        query = key + '=' + value
-        self.keys.add(key)
-        self.values.add(value)
-        self.queries.add(query)
 
-    def storeWordlist(self, list, filename):
-        '''
-        Store wordlists.
-        '''
-        with open(self.wordlistDir + filename, 'w') as file:
-            for item in list:
-                file.write(item+'\n')
+        url = self._to_str(url_obj.toString())
+        method = self._to_str(requestInfo.getMethod())
+
+        print("[%d/%d] %s %s" % (count, total, method, url))
+
+        self._extract_path(url)
+        self._extract_subdomain(url)
+
+        for param in requestInfo.getParameters():
+            self._extract_param(param)
+
+    # -------------------------
+    # Extractors
+    # -------------------------
+
+    def _extract_path(self, url):
+        parsed = urlparse(url)
+        self.wordlists.paths.add(parsed.path)
+
+    def _extract_subdomain(self, url):
+        parsed = urlparse(url)
+        host = parsed.netloc
+
+        if not host:
+            return
+
+        parts = host.split(".")
+        if len(parts) > 2:
+            self.wordlists.subdomains.add(".".join(parts[:-2]))
+
+    def _extract_param(self, param):
+        if int(param.getType()) not in (
+            PARAM_URL, PARAM_BODY, PARAM_JSON, PARAM_XML
+        ):
+            return
+
+        key = self._to_str(
+            self._helpers.bytesToString(param.getName())
+        )
+        value = self._to_str(
+            self._helpers.bytesToString(param.getValue())
+        )
+
+        self.wordlists.param_keys.add(key)
+        self.wordlists.param_values.add(value)
+        self.wordlists.param_queries.add("%s=%s" % (key, value))
+
+    # -------------------------
+    # Storage
+    # -------------------------
+
+    def _store_all(self):
+        self._store("paths.txt", self.wordlists.paths)
+        self._store("keys.txt", self.wordlists.param_keys)
+        self._store("values.txt", self.wordlists.param_values)
+        self._store("queries.txt", self.wordlists.param_queries)
+        self._store("subdomains.txt", self.wordlists.subdomains)
+
+    def _store(self, filename, items):
+        path = os.path.join(self.wordlistDir, filename)
+        with open(path, "w") as f:
+            for item in sorted(items):
+                f.write(item + "\n")
+
+    # -------------------------
+    # Utilities
+    # -------------------------
+
+    def _to_str(self, value):
+        if value is None:
+            return ""
+        if isinstance(value, unicode):
+            return value
+        try:
+            return value.decode("utf-8")
+        except:
+            return str(value)
 
     def getProjectTitle(self):
-        '''
-        Get the current project title.
-        There is no direct API call for this. Therefore, we retrieve
-        the title from the UI frame object.
-        '''
         for frame in Frame.getFrames():
-            if frame.isVisible() and frame.getTitle().startswith('Burp Suite'):
-                projectTitle = frame.getTitle().split('-')[1].strip()
-                # NOTE: This does not work for project names containing '-'.
-                return projectTitle
-
+            if frame.isVisible() and frame.getTitle().startswith("Burp Suite"):
+                return frame.getTitle().split("-", 1)[1].strip()
+        return "default"
