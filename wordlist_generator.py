@@ -1,12 +1,12 @@
 '''
-A Burp extension to extract various data from the sitemap.
-This data can later be used in personalized wordlists.
+Wordlist Generator Burp Extension with UI Tab and Context Menu
 
 Features:
-- UI tab with extraction options
-- Select output directory
-- Extract from full sitemap or in-scope only
-(Jython-compatible)
+- Extract paths, parameters, subdomains from sitemap
+- UI tab with checkboxes and output directory
+- Buttons: entire sitemap (all hosts) / in-scope only
+- Context menu for sitemap nodes
+- Fully Jython-compatible
 '''
 
 import threading
@@ -15,15 +15,14 @@ import sys
 import re
 from urlparse import urlparse
 
-from burp import IBurpExtender, ITab
-from burp.IParameter import (
-    PARAM_URL, PARAM_BODY, PARAM_JSON, PARAM_XML
-)
+from burp import IBurpExtender, ITab, IContextMenuFactory
+from burp.IContextMenuInvocation import CONTEXT_TARGET_SITE_MAP_TREE
+from burp.IParameter import PARAM_URL, PARAM_BODY, PARAM_JSON, PARAM_XML
 
 from java.util import ArrayList
 from javax.swing import (
     JPanel, JCheckBox, JButton, JTextField, JLabel,
-    JFileChooser, BoxLayout
+    JFileChooser, BoxLayout, JMenuItem
 )
 from java.awt import BorderLayout, Frame
 
@@ -63,7 +62,7 @@ class Wordlists(object):
 # Burp Extension
 # =========================
 
-class BurpExtender(IBurpExtender, ITab):
+class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
 
     # -------------------------
     # Burp registration
@@ -77,6 +76,7 @@ class BurpExtender(IBurpExtender, ITab):
         self._helpers = callbacks.getHelpers()
 
         callbacks.setExtensionName("Wordlist Generator")
+        callbacks.registerContextMenuFactory(self)
 
         self.wordlists = Wordlists()
         self.wordlistDir = self._init_output_dir()
@@ -88,6 +88,7 @@ class BurpExtender(IBurpExtender, ITab):
         self.opt_queries = True
         self.opt_subdomains = True
 
+        # Build UI tab
         self._build_ui()
         callbacks.addSuiteTab(self)
 
@@ -113,7 +114,6 @@ class BurpExtender(IBurpExtender, ITab):
         # === Options panel ===
         optionsPanel = JPanel()
         optionsPanel.setLayout(BoxLayout(optionsPanel, BoxLayout.Y_AXIS))
-
         optionsPanel.add(JLabel("Extraction options"))
 
         self.chk_paths = JCheckBox("Extract paths", True)
@@ -174,22 +174,18 @@ class BurpExtender(IBurpExtender, ITab):
 
     def _extract_all(self, event):
         self._apply_ui_settings()
+        # All items in sitemap, no scope filtering
         sitemap = self._callbacks.getSiteMap(None)
         self._run_async(self.generate, sitemap)
 
     def _extract_scope(self, event):
         self._apply_ui_settings()
         sitemap = self._callbacks.getSiteMap(None)
-
-        scoped = []
-        for rr in sitemap:
-            try:
-                reqInfo = self._helpers.analyzeRequest(rr)
-                if self._callbacks.isInScope(reqInfo.getUrl()):
-                    scoped.append(rr)
-            except:
-                pass
-
+        scoped = [
+            rr for rr in sitemap
+            if rr.getRequest() and
+            self._callbacks.isInScope(self._helpers.analyzeRequest(rr).getUrl())
+        ]
         self._run_async(self.generate, scoped)
 
     def _apply_ui_settings(self):
@@ -209,6 +205,44 @@ class BurpExtender(IBurpExtender, ITab):
         t = threading.Thread(target=target, args=args)
         t.daemon = True
         t.start()
+
+    # -------------------------
+    # Context Menu
+    # -------------------------
+
+    def createMenuItems(self, invocation):
+        if invocation.getInvocationContext() != CONTEXT_TARGET_SITE_MAP_TREE:
+            return None
+
+        menu = ArrayList()
+
+        # Entire sitemap
+        fullItem = JMenuItem(
+            "Generate wordlist from entire sitemap",
+            actionPerformed=lambda e: self._run_async(self.generate, self._callbacks.getSiteMap(None))
+        )
+        menu.add(fullItem)
+
+        # Selected items
+        selection = invocation.getSelectedMessages()
+        if selection:
+            selectedItem = JMenuItem(
+                "Generate wordlist from selection",
+                actionPerformed=lambda e: self._run_async(self.generate, selection)
+            )
+            menu.add(selectedItem)
+
+            # Selected items in-scope only
+            scopeItem = JMenuItem(
+                "Generate wordlist from selected in-scope items",
+                actionPerformed=lambda e: self._run_async(self.generate, [
+                    rr for rr in selection
+                    if self._callbacks.isInScope(self._helpers.analyzeRequest(rr).getUrl())
+                ])
+            )
+            menu.add(scopeItem)
+
+        return menu
 
     # -------------------------
     # Core logic
@@ -241,9 +275,6 @@ class BurpExtender(IBurpExtender, ITab):
 
         requestInfo = self._helpers.analyzeRequest(rr)
         url_obj = requestInfo.getUrl()
-
-        if not self._callbacks.isInScope(url_obj):
-            return
 
         url = self._to_str(url_obj.toString())
 
@@ -316,12 +347,8 @@ class BurpExtender(IBurpExtender, ITab):
         ):
             return
 
-        key = self._to_str(
-            self._helpers.bytesToString(param.getName())
-        )
-        value = self._to_str(
-            self._helpers.bytesToString(param.getValue())
-        )
+        key = self._to_str(self._helpers.bytesToString(param.getName()))
+        value = self._to_str(self._helpers.bytesToString(param.getValue()))
 
         if self.opt_keys:
             self.wordlists.param_keys.add(key)
