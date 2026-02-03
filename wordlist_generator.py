@@ -2,7 +2,7 @@
 Wordlist Generator Burp Extension with UI Tab and Context Menu
 
 Features:
-- Extract paths, parameters, subdomains from sitemap
+- Extract paths, filenames (with extensions), parameters, subdomains from sitemap
 - UI tab with checkboxes and output directory
 - Buttons: entire sitemap (all hosts) / in-scope only
 - Context menu for sitemap nodes
@@ -36,6 +36,7 @@ UUID_RE = re.compile(
     r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$',
     re.I
 )
+EXT_RE = re.compile(r'.+\.[a-zA-Z0-9]{1,10}$')  # filename with extension
 
 
 # =========================
@@ -45,6 +46,7 @@ UUID_RE = re.compile(
 class Wordlists(object):
     def __init__(self):
         self.paths = set()
+        self.filenames = set()
         self.param_keys = set()
         self.param_values = set()
         self.param_queries = set()
@@ -52,6 +54,7 @@ class Wordlists(object):
 
     def clear(self):
         self.paths.clear()
+        self.filenames.clear()
         self.param_keys.clear()
         self.param_values.clear()
         self.param_queries.clear()
@@ -83,6 +86,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
 
         # Default options
         self.opt_paths = True
+        self.opt_filenames = True
         self.opt_keys = True
         self.opt_values = True
         self.opt_queries = True
@@ -117,12 +121,14 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         optionsPanel.add(JLabel("Extraction options"))
 
         self.chk_paths = JCheckBox("Extract paths", True)
+        self.chk_filenames = JCheckBox("Extract filenames", True)
         self.chk_keys = JCheckBox("Extract parameter keys", True)
         self.chk_values = JCheckBox("Extract parameter values", True)
         self.chk_queries = JCheckBox("Extract parameter queries", True)
         self.chk_subdomains = JCheckBox("Extract subdomains", True)
 
         optionsPanel.add(self.chk_paths)
+        optionsPanel.add(self.chk_filenames)
         optionsPanel.add(self.chk_keys)
         optionsPanel.add(self.chk_values)
         optionsPanel.add(self.chk_queries)
@@ -132,16 +138,15 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         outputPanel = JPanel()
         outputPanel.setLayout(BoxLayout(outputPanel, BoxLayout.X_AXIS))
 
-        self.txt_output = JTextField(self.wordlistDir, 30)
+        self.txt_output_dir = JTextField(self.wordlistDir, 20)  # smaller field
         browseBtn = JButton("Browse", actionPerformed=self._browse_dir)
 
         outputPanel.add(JLabel("Output directory: "))
-        outputPanel.add(self.txt_output)
+        outputPanel.add(self.txt_output_dir)
         outputPanel.add(browseBtn)
 
         # === Buttons panel ===
         buttonsPanel = JPanel()
-
         allBtn = JButton(
             "Extract from entire sitemap",
             actionPerformed=self._extract_all
@@ -154,7 +159,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         buttonsPanel.add(allBtn)
         buttonsPanel.add(scopeBtn)
 
-        # === Assemble ===
+        # === Assemble main panel ===
         self._mainPanel.add(optionsPanel, BorderLayout.NORTH)
         self._mainPanel.add(outputPanel, BorderLayout.CENTER)
         self._mainPanel.add(buttonsPanel, BorderLayout.SOUTH)
@@ -164,7 +169,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY)
 
         if chooser.showOpenDialog(self._mainPanel) == JFileChooser.APPROVE_OPTION:
-            self.txt_output.setText(
+            self.txt_output_dir.setText(
                 chooser.getSelectedFile().getAbsolutePath()
             )
 
@@ -174,7 +179,6 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
 
     def _extract_all(self, event):
         self._apply_ui_settings()
-        # All items in sitemap, no scope filtering
         sitemap = self._callbacks.getSiteMap(None)
         self._run_async(self.generate, sitemap)
 
@@ -189,9 +193,9 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         self._run_async(self.generate, scoped)
 
     def _apply_ui_settings(self):
-        self.wordlistDir = self.txt_output.getText()
-
+        self.wordlistDir = self.txt_output_dir.getText()
         self.opt_paths = self.chk_paths.isSelected()
+        self.opt_filenames = self.chk_filenames.isSelected()
         self.opt_keys = self.chk_keys.isSelected()
         self.opt_values = self.chk_values.isSelected()
         self.opt_queries = self.chk_queries.isSelected()
@@ -275,11 +279,11 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
 
         requestInfo = self._helpers.analyzeRequest(rr)
         url_obj = requestInfo.getUrl()
-
         url = self._to_str(url_obj.toString())
 
-        if self.opt_paths:
+        if self.opt_paths or self.opt_filenames:
             self._extract_path(url)
+
         if self.opt_subdomains:
             self._extract_subdomain(url)
 
@@ -287,7 +291,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
             self._extract_param(param)
 
     # -------------------------
-    # Path extraction
+    # Path & filename extraction
     # -------------------------
 
     def _normalize_path(self, path):
@@ -307,24 +311,34 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
             return "{uuid}"
         return segment
 
+    def _is_filename(self, segment):
+        return bool(EXT_RE.match(segment))
+
     def _extract_path(self, url):
         parsed = urlparse(url)
         path = self._normalize_path(parsed.path)
-
         parts = [p for p in path.split("/") if p]
         current = []
 
-        for part in parts:
+        for idx, part in enumerate(parts):
+            # If the segment is a filename, add to filenames only
+            if self._is_filename(part):
+                if self.opt_filenames:
+                    self.wordlists.filenames.add(part)
+                # Do NOT add to paths
+                continue
+
+            # Handle unique segments
             if self._is_unique_segment(part):
-                generalized = [
-                    self._generalize_segment(p)
-                    for p in current + [part]
-                ]
-                self.wordlists.paths.add("/" + "/".join(generalized))
+                generalized = [self._generalize_segment(p) for p in current + [part]]
+                if self.opt_paths:
+                    self.wordlists.paths.add("/" + "/".join(generalized))
                 return
 
+            # Normal path segment
             current.append(part)
-            self.wordlists.paths.add("/" + "/".join(current))
+            if self.opt_paths:
+                self.wordlists.paths.add("/" + "/".join(current))
 
     # -------------------------
     # Other extractors
@@ -333,7 +347,6 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
     def _extract_subdomain(self, url):
         parsed = urlparse(url)
         host = parsed.netloc
-
         if not host:
             return
 
@@ -342,9 +355,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
             self.wordlists.subdomains.add(".".join(parts[:-2]))
 
     def _extract_param(self, param):
-        if int(param.getType()) not in (
-            PARAM_URL, PARAM_BODY, PARAM_JSON, PARAM_XML
-        ):
+        if int(param.getType()) not in (PARAM_URL, PARAM_BODY, PARAM_JSON, PARAM_XML):
             return
 
         key = self._to_str(self._helpers.bytesToString(param.getName()))
@@ -364,6 +375,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
     def _store_all(self):
         if self.opt_paths:
             self._store("paths.txt", self.wordlists.paths)
+        if self.opt_filenames:
+            self._store("filenames.txt", self.wordlists.filenames)
         if self.opt_keys:
             self._store("keys.txt", self.wordlists.param_keys)
         if self.opt_values:
@@ -400,10 +413,9 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
             return str(value)
 
     def _init_output_dir(self):
+        import os
         base = os.path.abspath(os.getcwd())
         path = os.path.join(base, "wordlists", self.getProjectTitle())
-        if not os.path.exists(path):
-            os.makedirs(path)
         return path
 
     def getProjectTitle(self):
