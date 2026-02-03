@@ -2,12 +2,17 @@
 A Burp extension to extract various data from the sitemap.
 This data can later be used in personalized wordlists.
 
-Refactored version (Jython-compatible).
+Path extraction:
+- Only from responses with HTTP 200
+- Discards paths with unique segments
+- Keeps generalized paths only
+(Jython-compatible)
 '''
 
 import threading
 import os
 import sys
+import re
 from urlparse import urlparse
 
 from burp import IBurpExtender, IContextMenuFactory
@@ -19,6 +24,17 @@ from burp.IContextMenuInvocation import CONTEXT_TARGET_SITE_MAP_TREE
 from java.util import ArrayList
 from javax.swing import JMenuItem
 from java.awt import Frame
+
+
+# =========================
+# Regexes
+# =========================
+
+NUM_RE = re.compile(r'^\d+$')
+UUID_RE = re.compile(
+    r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$',
+    re.I
+)
 
 
 # =========================
@@ -47,10 +63,6 @@ class Wordlists(object):
 
 class BurpExtender(IBurpExtender, IContextMenuFactory):
 
-    # -------------------------
-    # Initialization
-    # -------------------------
-
     def registerExtenderCallbacks(self, callbacks):
         sys.stdout = callbacks.getStdout()
         sys.stderr = callbacks.getStderr()
@@ -65,7 +77,6 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         self.wordlistDir = self._init_output_dir()
 
         print("Wordlist Generator initialized")
-        print("Writing to: %s" % self.wordlistDir)
 
     def _init_output_dir(self):
         base = os.path.abspath(os.getcwd())
@@ -119,37 +130,40 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
 
     def generate(self, requestResponses):
         self.wordlists.clear()
-
         total = len(requestResponses)
-        count = 0
 
         print("Generating wordlists (%d items)" % total)
 
-        for rr in requestResponses:
-            count += 1
+        for idx, rr in enumerate(requestResponses, 1):
             try:
-                self._process_request(rr, count, total)
+                self._process_request(rr)
             except Exception as e:
                 sys.stderr.write(
-                    "Error processing request (%d/%d): %s\n"
-                    % (count, total, str(e))
+                    "Error (%d/%d): %s\n" % (idx, total, str(e))
                 )
 
         self._store_all()
-        print("Done!")
+        print("Done")
 
-    def _process_request(self, requestResponse, count, total):
-        requestInfo = self._helpers.analyzeRequest(requestResponse)
+    def _process_request(self, rr):
+        # Must have a response
+        if rr.getResponse() is None:
+            return
+
+        responseInfo = self._helpers.analyzeResponse(rr.getResponse())
+        status = responseInfo.getStatusCode()
+
+        # Only HTTP 200
+        if status != 200:
+            return
+
+        requestInfo = self._helpers.analyzeRequest(rr)
         url_obj = requestInfo.getUrl()
 
         if not self._callbacks.isInScope(url_obj):
-            print("[%d/%d] %s (out of scope)" % (count, total, url_obj))
             return
 
         url = self._to_str(url_obj.toString())
-        method = self._to_str(requestInfo.getMethod())
-
-        print("[%d/%d] %s %s" % (count, total, method, url))
 
         self._extract_path(url)
         self._extract_subdomain(url)
@@ -158,12 +172,54 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             self._extract_param(param)
 
     # -------------------------
-    # Extractors
+    # Path Extraction (Strict)
     # -------------------------
+
+    def _normalize_path(self, path):
+        if not path:
+            return "/"
+        if len(path) > 1 and path.endswith("/"):
+            path = path[:-1]
+        return path
+
+    def _is_unique_segment(self, segment):
+        return (
+            NUM_RE.match(segment) or
+            UUID_RE.match(segment)
+        )
+
+    def _generalize_segment(self, segment):
+        if NUM_RE.match(segment):
+            return "{id}"
+        if UUID_RE.match(segment):
+            return "{uuid}"
+        return segment
 
     def _extract_path(self, url):
         parsed = urlparse(url)
-        self.wordlists.paths.add(parsed.path)
+        path = self._normalize_path(parsed.path)
+
+        parts = [p for p in path.split("/") if p]
+        current = []
+
+        for part in parts:
+            # If unique segment found, store ONLY generalized path and stop
+            if self._is_unique_segment(part):
+                generalized = [
+                    self._generalize_segment(p)
+                    for p in current + [part]
+                ]
+                self.wordlists.paths.add("/" + "/".join(generalized))
+                return
+
+            # Safe, non-unique segment
+            current.append(part)
+            self.wordlists.paths.add("/" + "/".join(current))
+
+
+    # -------------------------
+    # Other Extractors
+    # -------------------------
 
     def _extract_subdomain(self, url):
         parsed = urlparse(url)
