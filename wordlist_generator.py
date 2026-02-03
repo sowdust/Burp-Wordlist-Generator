@@ -1,14 +1,3 @@
-'''
-Wordlist Generator Burp Extension with UI Tab and Context Menu
-
-Features:
-- Extract paths, filenames (with extensions), parameters, subdomains from sitemap
-- UI tab with checkboxes and output directory
-- Buttons: entire sitemap (all hosts) / in-scope only
-- Context menu for sitemap nodes
-- Fully Jython-compatible
-'''
-
 import threading
 import os
 import sys
