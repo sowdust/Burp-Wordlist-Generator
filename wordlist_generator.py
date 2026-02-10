@@ -1,7 +1,22 @@
-import threading
+# -*- coding: utf-8 -*-
+
+'''
+Wordlist Generator – Stable Jython Burp Extension
+
+Features:
+- UI tab with extraction options
+- Max path depth (0 = unlimited)
+- Filenames extracted separately (segments with extensions)
+- Filenames excluded from paths
+- Append-only output
+- Buttons: entire sitemap / in-scope only
+- Context menu obeys UI settings
+'''
+
 import os
 import sys
 import re
+import threading
 from urlparse import urlparse
 
 from burp import IBurpExtender, ITab, IContextMenuFactory
@@ -11,7 +26,7 @@ from burp.IParameter import PARAM_URL, PARAM_BODY, PARAM_JSON, PARAM_XML
 from java.util import ArrayList
 from javax.swing import (
     JPanel, JCheckBox, JButton, JTextField, JLabel,
-    JFileChooser, BoxLayout, JMenuItem
+    JFileChooser, BoxLayout, JMenuItem, JSpinner, SpinnerNumberModel
 )
 from java.awt import BorderLayout, Frame
 
@@ -25,11 +40,11 @@ UUID_RE = re.compile(
     r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$',
     re.I
 )
-EXT_RE = re.compile(r'.+\.[a-zA-Z0-9]{1,10}$')  # filename with extension
+EXT_RE = re.compile(r'.+\.[A-Za-z0-9]{1,10}$')
 
 
 # =========================
-# Helper Classes
+# Data container
 # =========================
 
 class Wordlists(object):
@@ -57,57 +72,55 @@ class Wordlists(object):
 class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
 
     # -------------------------
-    # Burp registration
+    # Registration
     # -------------------------
 
     def registerExtenderCallbacks(self, callbacks):
-        sys.stdout = callbacks.getStdout()
-        sys.stderr = callbacks.getStderr()
-
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
+
+        sys.stdout = callbacks.getStdout()
+        sys.stderr = callbacks.getStderr()
 
         callbacks.setExtensionName("Wordlist Generator")
         callbacks.registerContextMenuFactory(self)
 
         self.wordlists = Wordlists()
-        self.wordlistDir = self._init_output_dir()
 
-        # Default options
+        # Defaults
+        self.wordlistDir = self._init_output_dir()
         self.opt_paths = True
         self.opt_filenames = True
         self.opt_keys = True
         self.opt_values = True
         self.opt_queries = True
         self.opt_subdomains = True
+        self.max_path_depth = 0  # 0 = unlimited
 
-        # Build UI tab
         self._build_ui()
         callbacks.addSuiteTab(self)
 
-        print("Wordlist Generator initialized")
+        print("[+] Wordlist Generator loaded")
 
     # -------------------------
-    # ITab implementation
+    # ITab
     # -------------------------
 
     def getTabCaption(self):
         return "Wordlist Generator"
 
     def getUiComponent(self):
-        return self._mainPanel
+        return self.mainPanel
 
     # -------------------------
     # UI
     # -------------------------
 
     def _build_ui(self):
-        self._mainPanel = JPanel(BorderLayout())
+        self.mainPanel = JPanel(BorderLayout())
 
-        # === Options panel ===
-        optionsPanel = JPanel()
-        optionsPanel.setLayout(BoxLayout(optionsPanel, BoxLayout.Y_AXIS))
-        optionsPanel.add(JLabel("Extraction options"))
+        options = JPanel()
+        options.setLayout(BoxLayout(options, BoxLayout.Y_AXIS))
 
         self.chk_paths = JCheckBox("Extract paths", True)
         self.chk_filenames = JCheckBox("Extract filenames", True)
@@ -116,91 +129,41 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         self.chk_queries = JCheckBox("Extract parameter queries", True)
         self.chk_subdomains = JCheckBox("Extract subdomains", True)
 
-        optionsPanel.add(self.chk_paths)
-        optionsPanel.add(self.chk_filenames)
-        optionsPanel.add(self.chk_keys)
-        optionsPanel.add(self.chk_values)
-        optionsPanel.add(self.chk_queries)
-        optionsPanel.add(self.chk_subdomains)
+        options.add(self.chk_paths)
+        options.add(self.chk_filenames)
+        options.add(self.chk_keys)
+        options.add(self.chk_values)
+        options.add(self.chk_queries)
+        options.add(self.chk_subdomains)
 
-        # === Output directory panel ===
+        depthPanel = JPanel()
+        depthPanel.add(JLabel("Max path depth (0 = unlimited): "))
+        self.spinner_depth = JSpinner(SpinnerNumberModel(0, 0, 20, 1))
+        depthPanel.add(self.spinner_depth)
+        options.add(depthPanel)
+
         outputPanel = JPanel()
-        outputPanel.setLayout(BoxLayout(outputPanel, BoxLayout.X_AXIS))
+        outputPanel.add(JLabel("Output directory:"))
+        self.txt_output = JTextField(self.wordlistDir, 20)
+        outputPanel.add(self.txt_output)
+        outputPanel.add(JButton("Browse", actionPerformed=self._browse))
 
-        self.txt_output_dir = JTextField(self.wordlistDir, 20)  # smaller field
-        browseBtn = JButton("Browse", actionPerformed=self._browse_dir)
+        buttons = JPanel()
+        buttons.add(JButton("Extract entire sitemap", actionPerformed=self._extract_all))
+        buttons.add(JButton("Extract in-scope only", actionPerformed=self._extract_scope))
 
-        outputPanel.add(JLabel("Output directory: "))
-        outputPanel.add(self.txt_output_dir)
-        outputPanel.add(browseBtn)
+        self.mainPanel.add(options, BorderLayout.NORTH)
+        self.mainPanel.add(outputPanel, BorderLayout.CENTER)
+        self.mainPanel.add(buttons, BorderLayout.SOUTH)
 
-        # === Buttons panel ===
-        buttonsPanel = JPanel()
-        allBtn = JButton(
-            "Extract from entire sitemap",
-            actionPerformed=self._extract_all
-        )
-        scopeBtn = JButton(
-            "Extract from in-scope only",
-            actionPerformed=self._extract_scope
-        )
-
-        buttonsPanel.add(allBtn)
-        buttonsPanel.add(scopeBtn)
-
-        # === Assemble main panel ===
-        self._mainPanel.add(optionsPanel, BorderLayout.NORTH)
-        self._mainPanel.add(outputPanel, BorderLayout.CENTER)
-        self._mainPanel.add(buttonsPanel, BorderLayout.SOUTH)
-
-    def _browse_dir(self, event):
+    def _browse(self, event):
         chooser = JFileChooser()
         chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY)
-
-        if chooser.showOpenDialog(self._mainPanel) == JFileChooser.APPROVE_OPTION:
-            self.txt_output_dir.setText(
-                chooser.getSelectedFile().getAbsolutePath()
-            )
+        if chooser.showOpenDialog(self.mainPanel) == JFileChooser.APPROVE_OPTION:
+            self.txt_output.setText(chooser.getSelectedFile().getAbsolutePath())
 
     # -------------------------
-    # Button handlers
-    # -------------------------
-
-    def _extract_all(self, event):
-        self._apply_ui_settings()
-        sitemap = self._callbacks.getSiteMap(None)
-        self._run_async(self.generate, sitemap)
-
-    def _extract_scope(self, event):
-        self._apply_ui_settings()
-        sitemap = self._callbacks.getSiteMap(None)
-        scoped = [
-            rr for rr in sitemap
-            if rr.getRequest() and
-            self._callbacks.isInScope(self._helpers.analyzeRequest(rr).getUrl())
-        ]
-        self._run_async(self.generate, scoped)
-
-    def _apply_ui_settings(self):
-        self.wordlistDir = self.txt_output_dir.getText()
-        self.opt_paths = self.chk_paths.isSelected()
-        self.opt_filenames = self.chk_filenames.isSelected()
-        self.opt_keys = self.chk_keys.isSelected()
-        self.opt_values = self.chk_values.isSelected()
-        self.opt_queries = self.chk_queries.isSelected()
-        self.opt_subdomains = self.chk_subdomains.isSelected()
-
-    # -------------------------
-    # Async helper
-    # -------------------------
-
-    def _run_async(self, target, *args):
-        t = threading.Thread(target=target, args=args)
-        t.daemon = True
-        t.start()
-
-    # -------------------------
-    # Context Menu
+    # Context menu
     # -------------------------
 
     def createMenuItems(self, invocation):
@@ -209,66 +172,98 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
 
         menu = ArrayList()
 
-        # Entire sitemap
-        fullItem = JMenuItem(
-            "Generate wordlist from entire sitemap",
-            actionPerformed=lambda e: self._run_async(self.generate, self._callbacks.getSiteMap(None))
-        )
-        menu.add(fullItem)
+        menu.add(JMenuItem(
+            "Generate wordlist (selection)",
+            actionPerformed=lambda e: self._run(invocation.getSelectedMessages())
+        ))
 
-        # Selected items
-        selection = invocation.getSelectedMessages()
-        if selection:
-            selectedItem = JMenuItem(
-                "Generate wordlist from selection",
-                actionPerformed=lambda e: self._run_async(self.generate, selection)
-            )
-            menu.add(selectedItem)
-
-            # Selected items in-scope only
-            scopeItem = JMenuItem(
-                "Generate wordlist from selected in-scope items",
-                actionPerformed=lambda e: self._run_async(self.generate, [
-                    rr for rr in selection
-                    if self._callbacks.isInScope(self._helpers.analyzeRequest(rr).getUrl())
-                ])
-            )
-            menu.add(scopeItem)
+        menu.add(JMenuItem(
+            "Generate wordlist (entire sitemap)",
+            actionPerformed=lambda e: self._run(self._callbacks.getSiteMap(None))
+        ))
 
         return menu
+
+    # -------------------------
+    # Execution
+    # -------------------------
+
+    def _apply_settings(self):
+        self.wordlistDir = self.txt_output.getText()
+        self.opt_paths = self.chk_paths.isSelected()
+        self.opt_filenames = self.chk_filenames.isSelected()
+        self.opt_keys = self.chk_keys.isSelected()
+        self.opt_values = self.chk_values.isSelected()
+        self.opt_queries = self.chk_queries.isSelected()
+        self.opt_subdomains = self.chk_subdomains.isSelected()
+        self.max_path_depth = int(self.spinner_depth.getValue())
+
+    def _extract_all(self, event):
+        print("extract all")
+        self._run(self._callbacks.getSiteMap(None))
+
+    def _is_rr_in_scope(self, rr):
+        try:
+            req = rr.getRequest()
+            if req is None:
+                return False
+
+            req_info = self._helpers.analyzeRequest(req)
+            url = req_info.getUrl()
+
+            return self._callbacks.isInScope(url)
+
+        except:
+            return False
+
+
+    def _extract_scope(self, event):
+        print("extract in scope")
+
+        sitemap = self._callbacks.getSiteMap(None)
+        scoped = [
+            rr for rr in sitemap
+            if rr.getRequest() and
+            self._callbacks.isInScope(
+                self._helpers.analyzeRequest(rr).getUrl()
+            )
+        ]
+
+        print(len(scoped))
+        self._run(scoped)
+
+    def _run(self, items):
+        self._apply_settings()
+        t = threading.Thread(target=self.generate, args=(items,))
+        t.daemon = True
+        t.start()
 
     # -------------------------
     # Core logic
     # -------------------------
 
-    def generate(self, requestResponses):
+    def generate(self, items):
         self.wordlists.clear()
-        total = len(requestResponses)
+        print("[*] Processing %d items" % len(items))
 
-        print("Generating wordlists (%d items)" % total)
-
-        for idx, rr in enumerate(requestResponses, 1):
+        for rr in items:
             try:
-                self._process_request(rr)
+                self._process(rr)
             except Exception as e:
-                sys.stderr.write(
-                    "Error (%d/%d): %s\n" % (idx, total, str(e))
-                )
+                sys.stderr.write("Error: %s\n" % e)
 
         self._store_all()
-        print("Done")
+        print("[+] Done")
 
-    def _process_request(self, rr):
+    def _process(self, rr):
         if rr.getResponse() is None:
             return
 
-        responseInfo = self._helpers.analyzeResponse(rr.getResponse())
-        if responseInfo.getStatusCode() != 200:
+        if self._helpers.analyzeResponse(rr.getResponse()).getStatusCode() != 200:
             return
 
-        requestInfo = self._helpers.analyzeRequest(rr)
-        url_obj = requestInfo.getUrl()
-        url = self._to_str(url_obj.toString())
+        req = self._helpers.analyzeRequest(rr)
+        url = req.getUrl().toString()
 
         if self.opt_paths or self.opt_filenames:
             self._extract_path(url)
@@ -276,55 +271,32 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         if self.opt_subdomains:
             self._extract_subdomain(url)
 
-        for param in requestInfo.getParameters():
-            self._extract_param(param)
+        for p in req.getParameters():
+            self._extract_param(p)
 
     # -------------------------
-    # Path & filename extraction
+    # Path / filename logic
     # -------------------------
-
-    def _normalize_path(self, path):
-        if not path:
-            return "/"
-        if len(path) > 1 and path.endswith("/"):
-            path = path[:-1]
-        return path
-
-    def _is_unique_segment(self, segment):
-        return NUM_RE.match(segment) or UUID_RE.match(segment)
-
-    def _generalize_segment(self, segment):
-        if NUM_RE.match(segment):
-            return "{id}"
-        if UUID_RE.match(segment):
-            return "{uuid}"
-        return segment
-
-    def _is_filename(self, segment):
-        return bool(EXT_RE.match(segment))
 
     def _extract_path(self, url):
-        parsed = urlparse(url)
-        path = self._normalize_path(parsed.path)
-        parts = [p for p in path.split("/") if p]
+        parts = [p for p in urlparse(url).path.split("/") if p]
         current = []
 
-        for idx, part in enumerate(parts):
-            # If the segment is a filename, add to filenames only
-            if self._is_filename(part):
-                if self.opt_filenames:
-                    self.wordlists.filenames.add(part)
-                # Do NOT add to paths
-                continue
+        for part in parts:
 
-            # Handle unique segments
-            if self._is_unique_segment(part):
-                generalized = [self._generalize_segment(p) for p in current + [part]]
-                if self.opt_paths:
-                    self.wordlists.paths.add("/" + "/".join(generalized))
+            if self.max_path_depth > 0 and len(current) >= self.max_path_depth:
                 return
 
-            # Normal path segment
+            if EXT_RE.match(part):
+                if self.opt_filenames:
+                    self.wordlists.filenames.add(part)
+                return
+
+            if NUM_RE.match(part) or UUID_RE.match(part):
+                if self.opt_paths:
+                    self.wordlists.paths.add("/" + "/".join(current + ["{id}"]))
+                return
+
             current.append(part)
             if self.opt_paths:
                 self.wordlists.paths.add("/" + "/".join(current))
@@ -334,11 +306,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
     # -------------------------
 
     def _extract_subdomain(self, url):
-        parsed = urlparse(url)
-        host = parsed.netloc
-        if not host:
-            return
-
+        host = urlparse(url).netloc
         parts = host.split(".")
         if len(parts) > 2:
             self.wordlists.subdomains.add(".".join(parts[:-2]))
@@ -347,21 +315,24 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         if int(param.getType()) not in (PARAM_URL, PARAM_BODY, PARAM_JSON, PARAM_XML):
             return
 
-        key = self._to_str(self._helpers.bytesToString(param.getName()))
-        value = self._to_str(self._helpers.bytesToString(param.getValue()))
+        key = self._helpers.bytesToString(param.getName())
+        val = self._helpers.bytesToString(param.getValue())
 
         if self.opt_keys:
             self.wordlists.param_keys.add(key)
         if self.opt_values:
-            self.wordlists.param_values.add(value)
+            self.wordlists.param_values.add(val)
         if self.opt_queries:
-            self.wordlists.param_queries.add("%s=%s" % (key, value))
+            self.wordlists.param_queries.add("%s=%s" % (key, val))
 
     # -------------------------
-    # Storage
+    # Storage (append-only)
     # -------------------------
 
     def _store_all(self):
+        if not os.path.exists(self.wordlistDir):
+            os.makedirs(self.wordlistDir)
+
         if self.opt_paths:
             self._store("paths.txt", self.wordlists.paths)
         if self.opt_filenames:
@@ -375,40 +346,19 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         if self.opt_subdomains:
             self._store("subdomains.txt", self.wordlists.subdomains)
 
-    def _store(self, filename, items):
-        if not items:
-            return
-
-        if not os.path.exists(self.wordlistDir):
-            os.makedirs(self.wordlistDir)
-
-        path = os.path.join(self.wordlistDir, filename)
-        with open(path, "w") as f:
-            for item in sorted(items):
-                f.write(item + "\n")
+    def _store(self, name, items):
+        path = os.path.join(self.wordlistDir, name)
+        with open(path, "a") as f:
+            for i in sorted(items):
+                f.write(i + "\n")
 
     # -------------------------
     # Utilities
     # -------------------------
 
-    def _to_str(self, value):
-        if value is None:
-            return ""
-        if isinstance(value, unicode):
-            return value
-        try:
-            return value.decode("utf-8")
-        except:
-            return str(value)
-
     def _init_output_dir(self):
-        import os
-        base = os.path.abspath(os.getcwd())
-        path = os.path.join(base, "wordlists", self.getProjectTitle())
+        base = os.getcwd()
+        path = os.path.join(base, "wordlists")
+        if not os.path.exists(path):
+            os.makedirs(path)
         return path
-
-    def getProjectTitle(self):
-        for frame in Frame.getFrames():
-            if frame.isVisible() and frame.getTitle().startswith("Burp Suite"):
-                return frame.getTitle().split("-", 1)[1].strip()
-        return "default"
